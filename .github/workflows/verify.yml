@@ -15,16 +15,16 @@ jobs:
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         uses: ./.github/actions/install-deps
 
       - name: Lint repo
-        run: pnpm lint:repo
+        run: pnpm --dir js lint:repo
 
       - name: Lint code
-        run: pnpm lint
+        run: pnpm --dir js lint
 
   build:
     name: Build JS
@@ -33,13 +33,13 @@ jobs:
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         uses: ./.github/actions/install-deps
 
       - name: Build
-        run: pnpm build
+        run: pnpm --dir js build
 
   unit:
     name: Unit Tests
@@ -48,13 +48,13 @@ jobs:
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         uses: ./.github/actions/install-deps
 
       - name: Run unit tests
-        run: pnpm test:unit
+        run: pnpm --dir js test:unit
 
   types:
     name: Check Types
@@ -62,32 +62,25 @@ jobs:
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         uses: ./.github/actions/install-deps
 
       - name: Build types package
-        run: pnpm --filter @fedimint/types build
+        run: pnpm --dir js --filter @fedimint/types build
 
       - name: Check types
-        run: pnpm typecheck
+        run: pnpm --dir js typecheck
 
   test:
     name: Test
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 45
-    # devimint's faucet listens on a fixed port (15243, hard-coded upstream), so two of
-    # these jobs on the same host race for it and the loser's tests talk to the winner's
-    # federation. Serialize all devimint-backed test jobs until the port is dynamic.
-    # See https://github.com/fedimint/fedimint-sdk/issues/340.
-    concurrency:
-      group: devimint-tests
-      queue: max
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -106,22 +99,22 @@ jobs:
             set -euo pipefail
 
             # Install dependencies
-            pnpm install
+            pnpm --dir js install
 
             # Build packages
-            pnpm build
+            pnpm --dir js build
 
             # Run Tests
-            pnpm test
+            pnpm --dir js test
           EOF
 
       - name: Report Size
         uses: alexlwn123/compressed-size-action@alex/fix-build
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-          pattern: '{packages/**/dist/**/*.{js,mjs,cjs},packages/**/*.wasm}'
-          install-script: nix develop --accept-flake-config -c pnpm install
-          build-script: nix develop --accept-flake-config -c pnpm build
+          pattern: 'js/{shared,web,react-native,tools}/**/{dist/**/*.{js,mjs,cjs},*.wasm}'
+          install-script: nix develop --accept-flake-config -c pnpm --dir js install
+          build-script: nix develop --accept-flake-config -c pnpm --dir js build
 
   build-docs:
     name: Build Docs
@@ -129,13 +122,13 @@ jobs:
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         uses: ./.github/actions/install-deps
 
       - name: Build Packages (dependency of docs)
-        run: pnpm build
+        run: pnpm --dir js build
 
       - name: Build Docs
-        run: pnpm docs:build
+        run: pnpm --dir js docs:build
