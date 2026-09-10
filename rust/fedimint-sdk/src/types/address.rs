@@ -4,7 +4,7 @@ use fedimint_core::bitcoin;
 use fedimint_core::bitcoin::address::NetworkUnchecked;
 
 use super::Network;
-use crate::{Error, ErrorCode};
+use crate::{Error, ErrorCode, Result};
 
 /// A Bitcoin address, for on-chain withdrawals.
 ///
@@ -55,6 +55,34 @@ impl Address {
             .into_iter()
             .filter(|network| self.address.is_valid_for_network(network.to_bitcoin()))
             .collect()
+    }
+
+    /// The raw, network-unchecked upstream address this wraps.
+    ///
+    /// Crate-internal: this is what a `walletv2` deposit is matched against in the client-wide
+    /// event log, which names the address it was paid to in the same network-unchecked shape.
+    pub(crate) fn as_unchecked(&self) -> &bitcoin::Address<NetworkUnchecked> {
+        &self.address
+    }
+
+    /// The checked upstream address for `network`, once that network has been confirmed
+    /// compatible.
+    ///
+    /// Crate-internal: this is what on-chain quoting and withdrawal execution pass to the
+    /// wallet module, which accepts only a network-checked address. Callers are expected to
+    /// have already confirmed `network` is one of [`Address::compatible_networks`]; this
+    /// re-checks rather than trusting that, so a caller that skipped the check gets
+    /// [`ErrorCode::NetworkMismatch`](crate::ErrorCode::NetworkMismatch) instead of a panic.
+    pub(crate) fn require_network(&self, network: Network) -> Result<bitcoin::Address> {
+        self.address
+            .clone()
+            .require_network(network.to_bitcoin())
+            .map_err(|err| {
+                Error::new(
+                    ErrorCode::NetworkMismatch,
+                    format!("address network check failed: {err}"),
+                )
+            })
     }
 
     /// The network prefix this address was actually spelled with, lowercased.

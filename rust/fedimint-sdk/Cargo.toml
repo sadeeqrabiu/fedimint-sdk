@@ -27,6 +27,10 @@ fedimint-client = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4
 fedimint-client-module = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
 fedimint-connectors = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
 fedimint-core = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
+# `walletv2` publishes no per-address deposit stream, only the shared client-wide event log; the
+# on-chain facade reads it directly to tell one deposit address's payment apart from another's.
+# See `src/onchain/v2.rs`.
+fedimint-eventlog = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
 fedimint-ln-client = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
 fedimint-ln-common = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
 fedimint-lnv2-client = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
@@ -35,7 +39,9 @@ fedimint-meta-client = { git = "https://github.com/fedimint/fedimint", rev = "1a
 fedimint-mint-client = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
 fedimint-mintv2-client = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
 fedimint-wallet-client = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
+fedimint-wallet-common = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
 fedimint-walletv2-client = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
+fedimint-walletv2-common = { git = "https://github.com/fedimint/fedimint", rev = "1ab15e4b89aaa35727ca16e401d0cbc7d066de58" }
 
 # `bip39` is named directly only to switch its `zeroize` feature on, which
 # `fedimint-bip39` does not: features are unioned, so this is the same single
@@ -51,6 +57,9 @@ serde_json = "1.0.149"
 tracing = "0.1.44"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+# `netwatch 0.5.0` (via `fedimint-core`) uses `socket2::Type::RAW` on BSD/macOS,
+# which requires `socket2`'s `all` feature. Features are unioned across the graph.
+socket2 = { version = "0.5.10", features = ["all"] }
 # `fd-lock` rather than the `fs-lock` fedimint uses for the embedded store's own
 # lock: this one is the SDK's single-opener claim, and it has to fail fast on
 # contention rather than block. See src/storage.rs.
