@@ -1429,8 +1429,12 @@ pub(crate) fn driver_for(kind: &str) -> Option<ErasedDriver> {
         kinds::LN_RECEIVE => Some(ErasedDriver::LnReceive(Arc::new(
             crate::lightning::LnReceiveDriver,
         ))),
-        kinds::ONCHAIN_SEND => None,
-        kinds::ONCHAIN_RECEIVE => None,
+        kinds::ONCHAIN_SEND => Some(ErasedDriver::OnchainSend(Arc::new(
+            crate::onchain::OnchainSendDriver,
+        ))),
+        kinds::ONCHAIN_RECEIVE => Some(ErasedDriver::OnchainReceive(Arc::new(
+            crate::onchain::OnchainReceiveDriver,
+        ))),
         kinds::RECOVERY => None,
         // A tag this build does not know, which `kind_of_tag` already reads as
         // `OperationKind::Unknown`.
@@ -1450,9 +1454,13 @@ pub(crate) fn backfillers() -> Vec<Arc<dyn Backfiller>> {
     return vec![
         Arc::new(ProbeBackfiller) as Arc<dyn Backfiller>,
         Arc::new(crate::lightning::LnBackfiller),
+        Arc::new(crate::onchain::OnchainBackfiller),
     ];
     #[cfg(not(test))]
-    vec![Arc::new(crate::lightning::LnBackfiller)]
+    vec![
+        Arc::new(crate::lightning::LnBackfiller),
+        Arc::new(crate::onchain::OnchainBackfiller),
+    ]
 }
 
 /// A driver for a real kind, so the type-erased accessors can be exercised end to end.
@@ -2288,13 +2296,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_kind_this_build_has_no_driver_for_yields_no_handle() {
-        let any = any_operation(kinds::ONCHAIN_SEND, "walletv2", READABLE_STATE_SCHEMA).await;
-        assert_eq!(any.kind(), OperationKind::OnchainSend);
+        let any = any_operation(kinds::ECASH_RECEIVE, "mint", READABLE_STATE_SCHEMA).await;
+        assert_eq!(any.kind(), OperationKind::EcashReceive);
         // `support` is about the record rather than about what this build can observe, so it
         // still says observable; the accessor is where a kind no facade has written a driver for
         // yet answers `None`, in exactly the way a kind mismatch does.
         assert_eq!(any.support(), OperationSupport::Observable);
-        assert!(any.as_onchain_send().is_none());
+        assert!(any.as_ecash_receive().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn onchain_kinds_yield_handles_when_matched() {
+        let any_send = any_operation(kinds::ONCHAIN_SEND, "wallet", READABLE_STATE_SCHEMA).await;
+        assert!(any_send.as_onchain_send().is_some());
+        let any_recv = any_operation(kinds::ONCHAIN_RECEIVE, "wallet", READABLE_STATE_SCHEMA).await;
+        assert!(any_recv.as_onchain_receive().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2434,8 +2450,8 @@ mod tests {
     #[test]
     fn this_build_observes_the_kinds_it_has_a_driver_for_and_no_others() {
         // The probe fixture stands in for the ecash-send driver T7 writes; the two lightning
-        // arms are real. Every other kind is a record this build can find, list and label but
-        // not observe, which the accessors report as `None` rather than as a failure.
+        // and two on-chain arms are real. Every other kind is a record this build can find, list
+        // and label but not observe, which the accessors report as `None` rather than as a failure.
         assert!(matches!(
             driver_for(kinds::ECASH_SEND),
             Some(ErasedDriver::EcashSend(_))
@@ -2448,14 +2464,22 @@ mod tests {
             driver_for(kinds::LN_RECEIVE),
             Some(ErasedDriver::LnReceive(_))
         ));
-        assert!(driver_for(kinds::ONCHAIN_SEND).is_none());
+        assert!(matches!(
+            driver_for(kinds::ONCHAIN_SEND),
+            Some(ErasedDriver::OnchainSend(_))
+        ));
+        assert!(matches!(
+            driver_for(kinds::ONCHAIN_RECEIVE),
+            Some(ErasedDriver::OnchainReceive(_))
+        ));
+        assert!(driver_for(kinds::ECASH_RECEIVE).is_none());
         assert!(driver_for(kinds::RECOVERY).is_none());
         // A tag this build does not know is not a lookup failure either.
         assert!(driver_for("something_else").is_none());
         // Backfillers are a list rather than a lookup: one is asked about an upstream module
         // kind, and one module kind can produce several of the SDK's kinds.
         let backfillers = backfillers();
-        assert_eq!(backfillers.len(), 2);
+        assert_eq!(backfillers.len(), 3);
         assert!(backfillers.iter().any(|b| {
             b.backfill("probe_module", &serde_json::Value::Null, 0)
                 .is_some()

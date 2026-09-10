@@ -1863,8 +1863,8 @@ mod tests {
         assert_eq!(found.kind(), crate::OperationKind::OnchainReceive);
         assert_eq!(found.raw_kind().module.as_deref(), Some("wallet"));
         assert!(
-            found.as_onchain_receive().is_none(),
-            "this build has no on-chain driver yet, so there is no typed handle"
+            found.as_onchain_receive().is_some(),
+            "an on-chain receive driver is registered, so a typed handle is available"
         );
         // The record itself is byte-for-byte what was written before the restart.
         let db = federation.db();
