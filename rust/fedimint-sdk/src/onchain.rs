@@ -3,7 +3,20 @@
 
 use std::sync::Arc;
 
-use crate::{Address, Amount, Operation, OperationState, Result, Sats, Timestamp, Txid};
+use fedimint_client::Client;
+use fedimint_client_module::ClientModuleInstance;
+
+use crate::{
+    Address, Amount, Error, ErrorCode, ErrorDetails, Network, Operation, OperationState, Result,
+    Sats, Timestamp, Txid,
+};
+
+mod driver;
+mod v1;
+mod v2;
+mod wire;
+
+pub(crate) use driver::{OnchainBackfiller, OnchainReceiveDriver, OnchainSendDriver};
 
 /// The on-chain facade for one federation, backed by its wallet module.
 ///
@@ -129,15 +142,12 @@ impl Onchain {
     /// [`Storage`](crate::ErrorCode::Storage), and
     /// [`FederationClosed`](crate::ErrorCode::FederationClosed).
     pub async fn receive(&self) -> Result<OnchainReceive> {
-        // Implementation notes (delete once implemented):
-        // - Persist the operation, including the address, in the same storage transaction
-        //   that creates it, before returning.
-        // - A receive that has not yet seen a transaction must not count toward
-        //   `forget_federation`'s pending-operations guard; only `WaitingForConfirmation`
-        //   onward should.
-        // - Reasoning about a second output paying the same address is a wallet-scanner
-        //   detail this contract deliberately does not promise on.
-        unimplemented!()
+        let federation = &self.inner.federation;
+        let client = federation.client(true).await?;
+        match module(&client)? {
+            OnchainModule::V1(module) => v1::receive(federation, &client, &module).await,
+            OnchainModule::V2(module) => v2::receive(federation, &client, &module).await,
+        }
     }
 
     /// Plans a withdrawal and returns an executable quote for it.
@@ -177,10 +187,48 @@ impl Onchain {
     /// [`Timeout`](crate::ErrorCode::Timeout), and
     /// [`FederationClosed`](crate::ErrorCode::FederationClosed).
     pub async fn quote(&self, address: &Address, amount: Sats) -> Result<OnchainQuote> {
-        // Implementation notes (delete once implemented):
-        // - The network check must run here, before anything is committed, on both wallet
-        //   module generations.
-        unimplemented!()
+        let federation = &self.inner.federation;
+        let expected_network: Network = federation.record().network.into();
+        check_network(address, expected_network)?;
+        if amount.sats() == 0 {
+            return Err(Error::new(
+                ErrorCode::InvalidInput,
+                "an on-chain withdrawal of zero satoshis cannot be quoted",
+            ));
+        }
+        // `fund_touching`: a quote does not move anything on its own, but it prices a
+        // withdrawal against the live balance and note inventory, which a recovering
+        // federation has not finished reconstructing yet.
+        let client = federation.client(true).await?;
+        // Only ever fails if `check_network` above passed and the federation's own network
+        // still is not one this address is valid for, which cannot happen: both read the same
+        // `expected_network`.
+        let checked_address = address.require_network(expected_network)?;
+        check_dust(&checked_address, amount)?;
+        let available = balance_of(&client).await?;
+        let plan = match module(&client)? {
+            OnchainModule::V1(module) => {
+                v1::quote(&client, &module, &checked_address, amount).await?
+            }
+            OnchainModule::V2(module) => {
+                v2::quote(&client, &module, &checked_address, amount).await?
+            }
+        };
+        if available < plan.total {
+            return Err(insufficient(plan.total, available));
+        }
+        let expires_at = Timestamp::from_epoch_millis(
+            crate::db::now_millis().saturating_add(QUOTE_VALIDITY_MILLIS),
+        );
+        Ok(OnchainQuote {
+            inner: OnchainQuoteInner {
+                federation_id: federation.id,
+                address: address.clone(),
+                amount,
+                plan,
+                expires_at,
+            },
+        })
     }
 
     /// Executes a quoted withdrawal.
@@ -220,12 +268,32 @@ impl Onchain {
     /// [`Storage`](crate::ErrorCode::Storage), and
     /// [`FederationClosed`](crate::ErrorCode::FederationClosed).
     pub async fn send(&self, quote: OnchainQuote) -> Result<Operation<OnchainSendState>> {
-        // Implementation notes (delete once implemented):
-        // - Re-check every bound input of the quote (fee estimate, federation config, note
-        //   selection) before funding; any drift is `QuoteChanged`, never a different debit.
-        // - Write `OnchainSendDetails` in the same storage transaction that creates the
-        //   operation.
-        unimplemented!()
+        let federation = &self.inner.federation;
+        let quote = quote.inner;
+        ensure_executable(&quote, federation.id, crate::db::now_millis())?;
+        // The guard is held across the re-check, the funding and the record write, which is
+        // what `create_operation` requires of its caller.
+        let client = federation.client(true).await?;
+        let expected_network: Network = federation.record().network.into();
+        // Only fails if the federation's network moved since the quote was issued, which the
+        // generation-and-config drift this call already refuses on covers; re-derived rather
+        // than stored, since a `bitcoin::Address` cannot be persisted on the quote without
+        // duplicating what `Address::require_network` already gives back cheaply.
+        let checked_address = quote.address.require_network(expected_network)?;
+        match (module(&client)?, &quote.plan.terms) {
+            (OnchainModule::V1(module), Terms::V1) => {
+                v1::send(federation, &client, &module, &quote, &checked_address).await
+            }
+            (OnchainModule::V2(module), Terms::V2) => {
+                v2::send(federation, &client, &module, &quote, &checked_address).await
+            }
+            // The federation changed generation between the quote and now, which the
+            // generation rule makes a different federation for every practical purpose.
+            _ => Err(Error::new(
+                ErrorCode::QuoteChanged,
+                "this federation's wallet module changed since the quote was issued",
+            )),
+        }
     }
 
     /// Builds the facade for one federation. Handed out by `Federation::onchain`.
@@ -260,7 +328,7 @@ impl OnchainQuote {
     ///
     /// This is *not* what leaves the balance; see [`OnchainQuote::total`].
     pub fn amount(&self) -> Sats {
-        unimplemented!()
+        self.inner.amount
     }
 
     /// The exact aggregate cost of this withdrawal, over and above
@@ -282,7 +350,7 @@ impl OnchainQuote {
     /// [`to_sats_exact`](crate::Amount::to_sats_exact) will normally return
     /// `None` here.
     pub fn fee(&self) -> Amount {
-        unimplemented!()
+        self.inner.plan.fee
     }
 
     /// The total that will be debited from the balance:
@@ -299,7 +367,7 @@ impl OnchainQuote {
     /// re-approves a new number instead of quietly paying a different one.
     /// This is the figure [`OnchainSendDetails::total`] records.
     pub fn total(&self) -> Amount {
-        unimplemented!()
+        self.inner.plan.total
     }
 
     /// [`OnchainQuote::fee`], split into the named parts it is made of.
@@ -313,7 +381,7 @@ impl OnchainQuote {
     /// balance; see [`OnchainSendFeeBreakdown`] for why a caller should not
     /// re-derive it by summing.
     pub fn fee_breakdown(&self) -> OnchainSendFeeBreakdown {
-        unimplemented!()
+        self.inner.plan.breakdown.clone()
     }
 
     /// When this quote stops being executable.
@@ -323,7 +391,7 @@ impl OnchainQuote {
     /// tend to be shorter-lived than lightning ones, because the fee
     /// estimate they carry tracks a moving mempool.
     pub fn expires_at(&self) -> Timestamp {
-        unimplemented!()
+        self.inner.expires_at
     }
 }
 
@@ -853,11 +921,237 @@ struct OnchainInner {
     federation: Arc<crate::federation::FederationInner>,
 }
 
-/// Placeholder for a quote's frozen plan: destination, amount, the fee and
-/// its components, and the configuration context they were computed
-/// against.
+/// A quote's frozen plan: the destination, the amount, the fee and its parts, the total, and the
+/// federation this quote is bound to, so `send` can tell whether any of it moved.
 #[derive(Debug)]
-struct OnchainQuoteInner;
+struct OnchainQuoteInner {
+    /// The federation the quote was made against. A quote is refused on any other.
+    federation_id: fedimint_core::config::FederationId,
+    address: Address,
+    amount: Sats,
+    plan: Plan,
+    expires_at: Timestamp,
+}
+
+/// What a withdrawal will cost and how it will go, for either module generation.
+#[derive(Debug)]
+struct Plan {
+    breakdown: OnchainSendFeeBreakdown,
+    /// The sum of `breakdown`.
+    fee: Amount,
+    /// `amount` (converted to msats) plus `fee`.
+    total: Amount,
+    terms: Terms,
+}
+
+/// Which module generation a plan was computed against. Carries no data of its own: unlike
+/// lightning's `Terms`, nothing about a withdrawal's execution depends on a value fixed at quote
+/// time, since `send` always re-fetches a fresh fee quote and refuses on drift rather than
+/// replaying the quoted one (the federation recomputes the transaction's weight itself and
+/// rejects a stale fee outright). This still has to be checked at `send` time, exactly as
+/// lightning's `Terms` is: a federation that changed module generation between the quote and
+/// the send is a different federation for every practical purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Terms {
+    V1,
+    V2,
+}
+
+/// The wallet module the live client has, whichever generation it is.
+///
+/// Module resolution is checked first for `walletv2`, matching the lightning facade's own
+/// generation-independence rule (a federation runs one generation of every module, and once a
+/// generation is resolved at quote time it is bound to the quote).
+enum OnchainModule<'a> {
+    V1(ClientModuleInstance<'a, fedimint_wallet_client::WalletClientModule>),
+    V2(ClientModuleInstance<'a, fedimint_walletv2_client::WalletClientModule>),
+}
+
+/// Picks the generation by asking the client, not the stored record: a facade obtained while a
+/// module was present and used after the configuration dropped it is the `NotSupported` case.
+fn module(client: &Client) -> Result<OnchainModule<'_>> {
+    if let Ok(module) = client.get_first_module::<fedimint_walletv2_client::WalletClientModule>() {
+        return Ok(OnchainModule::V2(module));
+    }
+    if let Ok(module) = client.get_first_module::<fedimint_wallet_client::WalletClientModule>() {
+        return Ok(OnchainModule::V1(module));
+    }
+    Err(Error::new(
+        ErrorCode::NotSupported,
+        "this federation has no wallet module",
+    ))
+}
+
+/// How long a quote stays executable after it is issued.
+///
+/// Shorter than lightning's (60 seconds, `lightning::QUOTE_VALIDITY_MILLIS`): an on-chain quote's
+/// fee estimate tracks a moving mempool feerate rather than a gateway's posted schedule, and
+/// re-quoting costs nothing a user would notice.
+const QUOTE_VALIDITY_MILLIS: u64 = 30_000;
+
+/// Every network a Bitcoin address encoding could stand for, as `Onchain::quote` checks it
+/// against the federation's own. Delegates entirely to [`Address::compatible_networks`], which
+/// is where the actual encoding ambiguity (a base58 test-family address, a `tb1` segwit address)
+/// is resolved; this exists only to fold that into the same [`ErrorDetails::NetworkMismatch`]
+/// shape lightning's `check_network` produces.
+fn check_network(address: &Address, expected: Network) -> Result<()> {
+    let compatible = address.compatible_networks();
+    if compatible.contains(&expected) {
+        return Ok(());
+    }
+    let observed_prefix = address.observed_prefix();
+    Err(Error::with_details(
+        ErrorCode::NetworkMismatch,
+        format!(
+            "the address is for {observed_prefix} but the federation runs on {}",
+            expected.as_str()
+        ),
+        ErrorDetails::NetworkMismatch {
+            expected,
+            compatible,
+            observed_prefix,
+        },
+    ))
+}
+
+/// Refuses an amount below the destination's dust limit: a bitcoin output worth less than this
+/// can never be economical to spend and every full node in the p2p network relays it, so both
+/// wallet modules refuse to build one.
+fn check_dust(address: &fedimint_core::bitcoin::Address, amount: Sats) -> Result<()> {
+    let dust_limit = address.script_pubkey().minimal_non_dust();
+    let requested = fedimint_core::bitcoin::Amount::from_sat(amount.sats());
+    if requested < dust_limit {
+        return Err(Error::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "{amount} is below this address's dust limit of {} sat",
+                dust_limit.to_sat()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a quote made for another federation or past its window.
+fn ensure_executable(
+    quote: &OnchainQuoteInner,
+    federation_id: fedimint_core::config::FederationId,
+    now_millis: u64,
+) -> Result<()> {
+    if quote.federation_id != federation_id {
+        return Err(Error::new(
+            ErrorCode::InvalidInput,
+            "this quote was issued by another federation",
+        ));
+    }
+    if now_millis > quote.expires_at.epoch_millis() {
+        return Err(quote_expired(quote.expires_at));
+    }
+    Ok(())
+}
+
+pub(super) fn to_upstream(amount: Amount) -> fedimint_core::Amount {
+    fedimint_core::Amount::from_msats(amount.msats())
+}
+
+pub(super) fn from_upstream(amount: fedimint_core::Amount) -> Amount {
+    Amount::from_msats(amount.msats)
+}
+
+pub(super) fn add(left: Amount, right: Amount) -> Result<Amount> {
+    left.checked_add(right)
+        .ok_or_else(|| Error::new(ErrorCode::Internal, "an amount overflowed"))
+}
+
+pub(super) fn quote_changed(quoted_total: Amount, current_total: Amount) -> Error {
+    Error::with_details(
+        ErrorCode::QuoteChanged,
+        format!(
+            "the withdrawal would now debit {} msat instead of the quoted {} msat",
+            current_total.msats(),
+            quoted_total.msats()
+        ),
+        ErrorDetails::QuoteTermsChanged {
+            quoted_total,
+            current_total,
+        },
+    )
+}
+
+pub(super) fn quote_expired(expires_at: Timestamp) -> Error {
+    Error::with_details(
+        ErrorCode::QuoteExpired,
+        "this quote is no longer executable; quote again",
+        ErrorDetails::QuoteExpired {
+            expires_at,
+            already_executed: false,
+        },
+    )
+}
+
+pub(super) fn insufficient(required: Amount, available: Amount) -> Error {
+    Error::with_details(
+        ErrorCode::InsufficientBalance,
+        format!(
+            "the withdrawal needs {} msat but only {} msat is spendable",
+            required.msats(),
+            available.msats()
+        ),
+        ErrorDetails::InsufficientBalance {
+            required,
+            available,
+        },
+    )
+}
+
+pub(super) fn internal(cause: impl core::fmt::Display) -> Error {
+    Error::new(ErrorCode::Internal, cause.to_string())
+}
+
+/// Maps a `send_fee_quote` dry-run's failure text: both mints report the notes on hand being
+/// short of what the dry run needed to balance the transaction, worded differently (the v1 mint,
+/// `fedimint-mint-client`, says "Insufficient balance"; the v2 mint, `fedimint-mintv2-client`,
+/// says "Insufficient funds", `fedimint-mintv2-client/src/lib.rs:503`), and this is reported as
+/// the balance problem it is rather than an opaque internal failure. Neither mint gives the
+/// wallet module a typed error carrying the exact shortfall the way lightning's dry run does, so
+/// the balance is read again here for the report; a failed read must not mask the real refusal
+/// that was already found, so it falls back to zero rather than turning this into an unrelated
+/// error.
+pub(super) async fn fee_quote_error(client: &Client, text: &str, required: Amount) -> Error {
+    if text.contains("Insufficient balance") || text.contains("Insufficient funds") {
+        let available = balance_of(client).await.unwrap_or(Amount::from_msats(0));
+        return insufficient(required, available);
+    }
+    unreachable_err(text)
+}
+
+pub(super) fn unreachable_err(cause: impl core::fmt::Display) -> Error {
+    Error::new(
+        ErrorCode::FederationUnreachable,
+        format!("the federation did not answer: {cause}"),
+    )
+}
+
+/// An upstream subscription that could not be opened, for either generation's driver.
+pub(super) fn subscribe_error(cause: impl core::fmt::Display) -> Error {
+    Error::new(
+        ErrorCode::Internal,
+        format!("could not follow this operation upstream: {cause}"),
+    )
+}
+
+/// The spendable balance, as `Federation::balance` reads it.
+pub(super) async fn balance_of(client: &Client) -> Result<Amount> {
+    client
+        .get_balance_for_btc()
+        .await
+        .map(from_upstream)
+        .map_err(|err| internal(format!("this federation cannot report a balance: {err}")))
+}
+
+pub(super) fn now() -> Timestamp {
+    Timestamp::from_epoch_millis(crate::db::now_millis())
+}
 
 #[cfg(test)]
 mod tests {
