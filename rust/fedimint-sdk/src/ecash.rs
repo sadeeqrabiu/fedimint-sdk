@@ -1463,6 +1463,7 @@ async fn mintv2_reclaim(
         )
     })?;
 
+    let client_arc = client.handle();
     let mintv2 = client
         .get_first_module::<fedimint_mintv2_client::MintClientModule>()
         .map_err(|_| Error::new(ErrorCode::NotSupported, "mintv2 module not found"))?;
@@ -1472,15 +1473,9 @@ async fn mintv2_reclaim(
     // `EcashBackfiller` must not rebuild it as an incoming ecash receive of its own.
     let reclaim_meta = serde_json::json!({ "facade": FACADE_ECASH_SEND_RECLAIM });
 
-    let outcome = match mintv2.receive(ecash, reclaim_meta).await {
-        Ok(op_id) => mintv2
-            .await_final_receive_operation_state(op_id)
-            .await
-            .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?,
-        Err(fedimint_mintv2_client::ReceiveECashError::AlreadyReceived) => mintv2
-            .await_final_receive_operation_state(reclaim_op_id)
-            .await
-            .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?,
+    let op_id = match mintv2.receive(ecash, reclaim_meta).await {
+        Ok(op_id) => op_id,
+        Err(fedimint_mintv2_client::ReceiveECashError::AlreadyReceived) => reclaim_op_id,
         // Not a redemption and not final: see this function's own doc comment for why
         // `InsufficientFunds` cannot be read as "the receiver got there first".
         Err(err @ fedimint_mintv2_client::ReceiveECashError::InsufficientFunds) => {
@@ -1494,6 +1489,22 @@ async fn mintv2_reclaim(
         }
         Err(err) => return Err(map_mintv2_receive_error(err)),
     };
+
+    // The client guard was held only for the bounded submission work above (`receive`).
+    // Release it here before waiting for the outcome: `await_final_receive_operation_state`
+    // waits on federation consensus (which is unbounded if the federation is slow or
+    // unreachable), and retaining the read guard across that await would block `quiesce()`
+    // from acquiring its write lock on close or shutdown.
+    drop(client);
+
+    let mintv2 = client_arc
+        .get_first_module::<fedimint_mintv2_client::MintClientModule>()
+        .map_err(|_| Error::new(ErrorCode::NotSupported, "mintv2 module not found"))?;
+
+    let outcome = mintv2
+        .await_final_receive_operation_state(op_id)
+        .await
+        .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
 
     Ok(match outcome {
         fedimint_mintv2_client::FinalReceiveOperationState::Success => EcashSendState::Canceled,
