@@ -148,7 +148,8 @@ impl Ecash {
                 let rounded_upstream = fee_consensus.round_up(upstream_amount);
                 let notes_value = Amount::from_msats(rounded_upstream.msats);
 
-                let balance = crate::federation::balance_of(&client).await?;
+                let balance =
+                    crate::federation::balance_of(&client, self.inner.federation.status()).await?;
                 if balance < notes_value {
                     return Err(Error::new(
                         ErrorCode::InsufficientBalance,
@@ -227,7 +228,8 @@ impl Ecash {
                 let rounded_upstream = fedimint_core::Amount::from_msats(rounded_msats);
                 let notes_value = Amount::from_msats(rounded_msats);
 
-                let balance = crate::federation::balance_of(&client).await?;
+                let balance =
+                    crate::federation::balance_of(&client, self.inner.federation.status()).await?;
                 if balance < notes_value {
                     return Err(Error::new(
                         ErrorCode::InsufficientBalance,
@@ -268,7 +270,8 @@ impl Ecash {
             .checked_add(fee)
             .ok_or_else(|| Error::new(ErrorCode::InvalidInput, "amount and fee overflow u64"))?;
 
-        let balance = crate::federation::balance_of(&client).await?;
+        let balance =
+            crate::federation::balance_of(&client, self.inner.federation.status()).await?;
         if balance < total {
             return Err(Error::new(
                 ErrorCode::InsufficientBalance,
@@ -389,7 +392,8 @@ impl Ecash {
         // selection below is what actually verifies the plan is still realizable;
         // this only saves a doomed selection attempt when the balance alone already
         // rules the quote out.
-        let current_balance = crate::federation::balance_of(&client).await?;
+        let current_balance =
+            crate::federation::balance_of(&client, self.inner.federation.status()).await?;
         if current_balance < quote.total()
             || current_balance.msats() != quote.inner.balance_snapshot_msats
         {
